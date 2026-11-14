@@ -748,6 +748,7 @@ public void Optimize(ref Module m) {
     }
     InlineSmall(ref m);
     SplitLocals(ref m);
+    PromoteFields(ref m);
     PromoteLocals(ref m);
     for (u32 fi = 1; fi < m.Funcs.Len() as u32; fi++) {
         if (m.Func(fi).Extern) continue;

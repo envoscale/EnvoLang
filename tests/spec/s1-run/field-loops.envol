@@ -1,0 +1,66 @@
+// Fields a loop reads and writes through `this` or a `ref` parameter keep their values
+// across calls that change them, early returns, breaks and nested loops.
+// expect: skip 8 3
+// expect: bumped 20
+// expect: nested 12 4
+// expect: stopped 5
+struct Lx {
+    str Src;
+    usize Pos;
+    u32 Line;
+
+    void Skip(ref this) {
+        while (this.Pos < this.Src.Len) {
+            u8 c = this.Src[this.Pos];
+            if (c == 10) this.Line++;
+            else if (c != 32) return;
+            this.Pos++;
+        }
+    }
+}
+
+struct Counter {
+    u64 N;
+    u64 Calls;
+}
+
+void Bump(ref Counter c) {
+    c.N += 10;
+    c.Calls++;
+}
+
+void Run(ref Counter c) {
+    for (u32 i = 0; i < 3; i++) {
+        c.N++;
+        if (i == 1) Bump(ref c);
+        c.N--;
+    }
+    c.N += c.Calls * 10 + 10 - 10;
+}
+
+void Grid(ref Counter c) {
+    for (u32 i = 0; i < 4; i++) {
+        for (u32 j = 0; j < 3; j++) c.N++;
+        c.Calls++;
+    }
+}
+
+u64 StopAt(ref Counter c, u64 limit) {
+    while (true) {
+        c.N++;
+        if (c.N == limit) break;
+    }
+    return c.N;
+}
+
+Lx l = new Lx { Src = "   \n  \n x", Pos = 0, Line = 1 };
+l.Skip();
+if (l.Pos == 8 && l.Line == 3) print("skip 8 3"); else print("skip wrong");
+Counter a = new Counter { N = 0, Calls = 0 };
+Run(ref a);
+if (a.N == 20 && a.Calls == 1) print("bumped 20"); else print("bump wrong");
+Counter g = new Counter { N = 0, Calls = 0 };
+Grid(ref g);
+if (g.N == 12 && g.Calls == 4) print("nested 12 4"); else print("nested wrong");
+Counter s = new Counter { N = 0, Calls = 0 };
+if (StopAt(ref s, 5) == 5 && s.N == 5) print("stopped 5"); else print("stop wrong");

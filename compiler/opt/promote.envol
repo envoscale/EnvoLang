@@ -1,0 +1,432 @@
+// -O2: a field read and written in a loop through a pointer only this function uses there
+// lives in a local for the loop (which promotion then makes a value): loaded before the
+// loop, stored back where it leaves and around the calls that are passed the pointer.
+// `while (...) this.Pos++` then keeps Pos in a register.
+//
+// The pointer is a parameter that points to valid memory for the call (`ref` and `in`
+// parameters, `this`) or a local. EnvoL's borrows make such memory reachable, while the
+// function runs, only through that pointer: no other parameter or global names the same
+// place (a `ref` is exclusive, an `in` is not written). So stores through other pointers
+// leave the field alone, and a call can reach it only if passed the pointer or an address
+// inside it.
+namespace envoc.opt;
+
+use envoc.util;
+use envoc.eir;
+
+const u16 PF_SLOT = 3;
+const u16 PF_LOAD = 42;
+const u16 PF_STORE = 43;
+const u16 PF_FIELD = 44;
+const u16 PF_ELEM = 45;
+const u16 PF_PTRADD = 46;
+const u16 PF_CALL = 52;
+const u16 PF_CALLIND = 53;
+const u16 PF_INTRINSIC = 54;
+const u16 PF_BR = 55;
+
+// One field to promote in one loop (blocks relative, values absolute).
+struct PromoteSite {
+    u32 Pre;            // the preheader
+    u32 Base;           // the pointer
+    u32 StructTy;       // its type and the field's index
+    u32 Field;
+    u32 FieldTy;        // the field's (scalar) type
+}
+
+public void PromoteFields(ref Module m) {
+    for (u32 fi = 1; fi < m.Funcs.Len() as u32; fi++) {
+        if (m.Func(fi).Extern) continue;
+        for (u32 round = 0; round < 8; round++) {
+            if (!PromoteOne(ref m, fi)) break;
+        }
+    }
+}
+
+// Promotes one field of one loop of function fi; true if it did.
+bool PromoteOne(ref Module m, u32 fi) {
+    EFunc f = m.Func(fi);
+    u32 nb = f.NBlocks;
+    u32 nv = f.NValues;
+    if (nb < 2) return false;
+    bool backward = false;
+    for (u32 b = 0; b < nb && !backward; b++) {
+        EBlock blk = m.Block(f.FirstBlock + b);
+        EInst term = m.Inst(blk.FirstInst + blk.NInsts - 1);
+        for (u32 o = term.FirstOp; o < term.FirstOp + term.NOps; o++) {
+            EOp op = m.Op(o);
+            if (op.Kind == OK_TARGET && op.Ref - f.FirstBlock <= b) backward = true;
+        }
+    }
+    if (!backward) return false;
+    // per value: is it the root of (or derived from) a pointer, and how it is used
+    List<u32> uses = List<u32>.New();
+    for (u32 k = 0; k < nv; k++) uses.Push(0);
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + nb; b++) {
+        EBlock blk = m.Block(b);
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = m.Inst(i);
+            for (u32 o = inst.FirstOp; o < inst.FirstOp + inst.NOps; o++) {
+                EOp op = m.Op(o);
+                if (op.Kind == OK_VALUE && op.Ref - f.FirstValue < nv) uses.Set((op.Ref - f.FirstValue) as usize, uses.Get((op.Ref - f.FirstValue) as usize) + 1);
+            }
+        }
+    }
+    Cfg g = BuildCfg(m, f);
+    for (u32 t = 0; t < nb; t++) {
+        for (u32 sj = g.SFirst.Get(t as usize); sj < g.SFirst.Get((t + 1) as usize); sj++) {
+            u32 h = g.SList.Get(sj as usize);
+            if (!g.Dom.Has(t, h)) continue;
+            List<bool> inLoop = List<bool>.New();
+            for (u32 b = 0; b < nb; b++) inLoop.Push(false);
+            inLoop.Set(h as usize, true);
+            List<u32> body = List<u32>.New();
+            body.Push(h);
+            List<u32> work = List<u32>.New();
+            if (t != h) {
+                inLoop.Set(t as usize, true);
+                work.Push(t);
+                body.Push(t);
+            }
+            while (work.Len() > 0) {
+                u32 b = work.Pop().Unwrap();
+                for (u32 j = g.PFirst.Get(b as usize); j < g.PFirst.Get((b + 1) as usize); j++) {
+                    u32 p = g.PList.Get(j as usize);
+                    if (!inLoop.Get(p as usize)) {
+                        inLoop.Set(p as usize, true);
+                        work.Push(p);
+                        body.Push(p);
+                    }
+                }
+            }
+            // the preheader: the one outside predecessor of h, ending in `br h`
+            u32 pre = nb;
+            u32 outside = 0;
+            for (u32 j = g.PFirst.Get(h as usize); j < g.PFirst.Get((h + 1) as usize); j++) {
+                u32 p = g.PList.Get(j as usize);
+                if (inLoop.Get(p as usize)) continue;
+                outside++;
+                pre = p;
+            }
+            if (outside != 1) continue;
+            EBlock pb = m.Block(f.FirstBlock + pre);
+            if (m.Inst(pb.FirstInst + pb.NInsts - 1).Op != PF_BR) continue;
+            // every way out goes to a block entered only from the loop
+            bool exitsOk = true;
+            for (usize bj = 0; bj < body.Len() && exitsOk; bj++) {
+                u32 b = body.Get(bj);
+                for (u32 sk = g.SFirst.Get(b as usize); sk < g.SFirst.Get((b + 1) as usize) && exitsOk; sk++) {
+                    u32 x = g.SList.Get(sk as usize);
+                    if (inLoop.Get(x as usize)) continue;
+                    for (u32 j = g.PFirst.Get(x as usize); j < g.PFirst.Get((x + 1) as usize); j++) {
+                        if (!inLoop.Get(g.PList.Get(j as usize) as usize)) exitsOk = false;
+                    }
+                    if (m.Block(f.FirstBlock + x).NParams != 0) exitsOk = false;
+                }
+            }
+            if (!exitsOk) continue;
+            // candidates: `fieldaddr $S root, k` in the loop with a root from outside
+            for (usize bj = 0; bj < body.Len(); bj++) {
+                EBlock blk = m.Block(f.FirstBlock + body.Get(bj));
+                for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+                    EInst fa = m.Inst(i);
+                    if (fa.Op != PF_FIELD || fa.NOps != 1 || m.Op(fa.FirstOp).Kind != OK_VALUE) continue;
+                    u32 root = m.Op(fa.FirstOp).Ref;
+                    u32 bb = m.Val(root).Block -% f.FirstBlock;
+                    if (bb < nb && inLoop.Get(bb as usize)) continue;
+                    PromoteSite site = new PromoteSite { Pre = pre, Base = root, StructTy = fa.Ty, Field = fa.Imm as u32, FieldTy = 0 };
+                    if (!PfPromotable(m, f, ref site, inLoop, body, uses)) continue;
+                    PfRewrite(ref m, fi, site, inLoop, body);
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Is the field of site.Base safe and worth promoting in the loop? Sets site.FieldTy.
+bool PfPromotable(in Module m, in EFunc f, ref PromoteSite site, in List<bool> inLoop, in List<u32> body, in List<u32> uses) {
+    u32 root = site.Base;
+    u32 rk = root - f.FirstValue;
+    // the root: a parameter valid for the call, or a slot
+    bool param = rk < f.NParams && rk < 64 && (f.Deref >> rk as u64) & 1 != 0;
+    u32 bi = m.Val(root).Inst;
+    bool slot = bi != 0 && m.Inst(bi).Op == PF_SLOT;
+    if (!param && !slot) return false;
+    // anywhere in the function, the root and the addresses inside it are only dereferenced,
+    // taken further inside, or passed to calls (never stored, passed to a block, or
+    // handed to an intrinsic)
+    List<bool> derived = List<bool>.New();
+    for (u32 k = 0; k < f.NValues; k++) derived.Push(false);
+    derived.Set(rk as usize, true);
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+            EBlock blk = m.Block(b);
+            for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+                EInst inst = m.Inst(i);
+                if (inst.Result == 0 || derived.Get((inst.Result - f.FirstValue) as usize)) continue;
+                if ((inst.Op == PF_FIELD || inst.Op == PF_ELEM || inst.Op == PF_PTRADD) && m.Op(inst.FirstOp).Kind == OK_VALUE && derived.Get((m.Op(inst.FirstOp).Ref - f.FirstValue) as usize)) {
+                    derived.Set((inst.Result - f.FirstValue) as usize, true);
+                    grew = true;
+                }
+            }
+        }
+    }
+    u32 members = 0;
+    u32 ty = 0;
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        EBlock blk = m.Block(b);
+        bool here = inLoop.Get((b - f.FirstBlock) as usize);
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = m.Inst(i);
+            for (u32 o = inst.FirstOp; o < inst.FirstOp + inst.NOps; o++) {
+                EOp op = m.Op(o);
+                if (op.Kind == OK_TARGET) {
+                    for (u32 a = 0; a < op.NArgs; a++) {
+                        u32 av = m.Arg(op.Args + a) - f.FirstValue;
+                        if (av < f.NValues && derived.Get(av as usize)) return false;
+                    }
+                    continue;
+                }
+                if (op.Kind != OK_VALUE) continue;
+                u32 v = op.Ref - f.FirstValue;
+                if (v >= f.NValues || !derived.Get(v as usize)) continue;
+                u32 at = o - inst.FirstOp;
+                if (inst.Op == PF_STORE && at == 0) return false;        // stored as a value
+                if (inst.Op == PF_INTRINSIC) return false;
+                if (!here) continue;
+                // inside the loop: the field's own accesses, other fields, and calls
+                if (inst.Op == PF_FIELD && op.Ref == root) {
+                    if (inst.Ty != site.StructTy) return false;
+                    if (inst.Imm as u32 != site.Field) continue;        // another field
+                    // the field: loaded and stored, of one scalar type, nothing else
+                    if (!PfOnlyAccessed(m, f, inst.Result, ref ty, ref members, body)) return false;
+                } else if (inst.Op == PF_FIELD || inst.Op == PF_LOAD || inst.Op == PF_STORE || inst.Op == PF_CALL || inst.Op == PF_CALLIND) {
+                    // a field further in, an access through an address inside the root, or
+                    // a call: fine if it cannot reach the field (checked below for calls)
+                    if ((inst.Op == PF_LOAD || inst.Op == PF_STORE) && op.Ref == root) return false;
+                    // the field's own accesses (PfOnlyAccessed checks them at its address)
+                    if ((inst.Op == PF_LOAD || inst.Op == PF_STORE) && PfIsField(m, op.Ref, root, site.StructTy, site.Field)) continue;
+                    if ((inst.Op == PF_LOAD || inst.Op == PF_STORE) && !PfOtherField(m, f, op.Ref, root, site.Field)) return false;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    if (members < 2 || ty == 0) return false;
+    // only where no call in the loop can reach the field: storing and loading it around
+    // each such call, and keeping it across calls, costs more than it saves
+    for (usize bj = 0; bj < body.Len(); bj++) {
+        EBlock blk = m.Block(f.FirstBlock + body.Get(bj));
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            u16 op = m.Inst(i).Op;
+            if ((op == PF_CALL || op == PF_CALLIND) && PfCallReaches(m, f, i, root, site.Field)) return false;
+        }
+    }
+    site.FieldTy = ty;
+    return true;
+}
+
+// Is every use of field address fa (in the loop's blocks) a load or the address of a store,
+// of one scalar type? Counts them.
+bool PfOnlyAccessed(in Module m, in EFunc f, u32 fa, ref u32 ty, ref u32 members, in List<u32> body) {
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        EBlock blk = m.Block(b);
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = m.Inst(i);
+            for (u32 o = inst.FirstOp; o < inst.FirstOp + inst.NOps; o++) {
+                EOp op = m.Op(o);
+                if (op.Kind == OK_TARGET) {
+                    for (u32 a = 0; a < op.NArgs; a++) {
+                        if (m.Arg(op.Args + a) == fa) return false;
+                    }
+                    continue;
+                }
+                if (op.Kind != OK_VALUE || op.Ref != fa) continue;
+                u32 at = o - inst.FirstOp;
+                bool access = (inst.Op == PF_LOAD && at == 0) || (inst.Op == PF_STORE && at == 1);
+                if (!access) return false;
+                if (m.IsFloat(inst.Ty) || m.Ty(inst.Ty).Size > 8 || m.Ty(inst.Ty).Size == 0) return false;
+                if (ty == 0) ty = inst.Ty;
+                else if (ty != inst.Ty) return false;
+                members++;
+            }
+        }
+    }
+    return true;
+}
+
+// Is p `fieldaddr $ty root, k`?
+bool PfIsField(in Module m, u32 p, u32 root, u32 ty, u32 k) {
+    u32 di = m.Val(p).Inst;
+    if (di == 0) return false;
+    EInst d = m.Inst(di);
+    return d.Op == PF_FIELD && d.Ty == ty && d.Imm as u32 == k && m.Op(d.FirstOp).Ref == root;
+}
+
+// Is pointer p a field (other than k) of root, or inside one?
+bool PfOtherField(in Module m, in EFunc f, u32 p, u32 root, u32 k) {
+    u32 v = p;
+    for (u32 guard = 0; guard < 32; guard++) {
+        u32 di = m.Val(v).Inst;
+        if (di == 0) return false;
+        EInst d = m.Inst(di);
+        if (d.Op != PF_FIELD && d.Op != PF_ELEM && d.Op != PF_PTRADD) return false;
+        u32 from = m.Op(d.FirstOp).Ref;
+        if (from == root) return d.Op == PF_FIELD && d.Imm as u32 != k;
+        v = from;
+    }
+    return false;
+}
+
+// Does call i pass root, or an address that may reach field k of it?
+bool PfCallReaches(in Module m, in EFunc f, u32 i, u32 root, u32 k) {
+    EInst inst = m.Inst(i);
+    for (u32 o = inst.FirstOp; o < inst.FirstOp + inst.NOps; o++) {
+        EOp op = m.Op(o);
+        if (op.Kind != OK_VALUE) continue;
+        u32 v = op.Ref;
+        for (u32 guard = 0; guard < 32; guard++) {
+            if (v == root) return true;
+            u32 di = m.Val(v).Inst;
+            if (di == 0) break;
+            EInst d = m.Inst(di);
+            if (d.Op != PF_FIELD && d.Op != PF_ELEM && d.Op != PF_PTRADD) break;
+            u32 from = m.Op(d.FirstOp).Ref;
+            if (from == root && d.Op == PF_FIELD && d.Imm as u32 != k) break;
+            v = from;
+        }
+    }
+    return false;
+}
+
+// The function again, with the field in a new local through the loop.
+void PfRewrite(ref Module m, u32 fi, in PromoteSite site, in List<bool> inLoop, in List<u32> body) {
+    EFunc f = m.Func(fi);
+    u32 nb = f.NBlocks;
+    u32 nv = f.NValues;
+    u32 v0 = m.Vals.Len() as u32;
+    u32 b0 = m.Blocks.Len() as u32;
+    // the loop's accesses go to the local (value nv, relative): edited in place, then moved
+    for (usize bj = 0; bj < body.Len(); bj++) {
+        EBlock blk = m.Block(f.FirstBlock + body.Get(bj));
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = m.Inst(i);
+            if (inst.Op != PF_LOAD && inst.Op != PF_STORE) continue;
+            u32 ao = inst.FirstOp;
+            if (inst.Op == PF_STORE) ao = inst.FirstOp + 1;
+            EOp a = m.Op(ao);
+            if (a.Kind != OK_VALUE) continue;
+            u32 di = m.Val(a.Ref).Inst;
+            if (di == 0) continue;
+            EInst d = m.Inst(di);
+            if (d.Op != PF_FIELD || m.Op(d.FirstOp).Ref != site.Base || d.Imm as u32 != site.Field || d.Ty != site.StructTy) continue;
+            a.Ref = f.FirstValue + nv;
+            m.Ops.Set(ao as usize, a);
+        }
+    }
+    for (u32 k = 0; k < nv; k++) {
+        EVal old = m.Val(f.FirstValue + k);
+        // (a value of an instruction that is gone may name a block from before)
+        if (old.Block >= f.FirstBlock && old.Block < f.FirstBlock + nb) old.Block = old.Block - f.FirstBlock + b0;
+        else old.Block = b0;
+        m.Vals.Push(old);
+    }
+    u32 local = m.Vals.Len() as u32;            // v0 + nv
+    m.Vals.Push(new EVal { Type = ET_PTR, Block = b0, Inst = 0, Pos = 0 });
+    u32 addr = m.Vals.Len() as u32;             // the field's address, made in the preheader
+    m.Vals.Push(new EVal { Type = ET_PTR, Block = b0 + site.Pre, Inst = 0, Pos = 0 });
+    u32 root = v0 + site.Base - f.FirstValue;
+    for (u32 b = 0; b < nb; b++) {
+        EBlock blk = m.Block(f.FirstBlock + b);
+        u32 nbk = b0 + b;
+        u32 first = m.Insts.Len() as u32;
+        bool slots = b == 0;
+        bool exit = !inLoop.Get(b as usize) && PfIsExit(m, f, b, inLoop);
+        if (exit) PfStoreBack(ref m, nbk, site, local, addr);
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = m.Inst(i);
+            if (slots && inst.Op != PF_SLOT) {
+                PfEmit(ref m, nbk, PF_SLOT, site.FieldTy, local, NONE, NONE, 0);
+                slots = false;
+            }
+            bool last = i == blk.FirstInst + blk.NInsts - 1;
+            if (last && b == site.Pre) {
+                // before the preheader's branch: the field into the local
+                PfEmit(ref m, nbk, PF_FIELD, site.StructTy, addr, root, NONE, site.Field as u64);
+                u32 v = PfNew(ref m, site.FieldTy, nbk);
+                PfEmit(ref m, nbk, PF_LOAD, site.FieldTy, v, addr, NONE, 0);
+                PfEmit(ref m, nbk, PF_STORE, site.FieldTy, 0, v, local, 0);
+            }
+            bool call = inLoop.Get(b as usize) && (inst.Op == PF_CALL || inst.Op == PF_CALLIND) && PfCallReaches(m, f, i, site.Base, site.Field);
+            if (call) PfStoreBack(ref m, nbk, site, local, addr);
+            Move(ref m, i, nbk, f, v0, b0);
+            if (call) {
+                // and back: the call may have changed it
+                u32 y = PfNew(ref m, site.FieldTy, nbk);
+                PfEmit(ref m, nbk, PF_LOAD, site.FieldTy, y, addr, NONE, 0);
+                PfEmit(ref m, nbk, PF_STORE, site.FieldTy, 0, y, local, 0);
+            }
+        }
+        u32 fp = 0;
+        if (blk.NParams > 0) fp = v0 + blk.FirstParam - f.FirstValue;
+        m.Blocks.Push(new EBlock { Func = fi, FirstParam = fp, NParams = blk.NParams, FirstInst = first, NInsts = m.Insts.Len() as u32 - first, Pos = 0 });
+    }
+    EFunc nf = m.Func(fi);
+    nf.FirstValue = v0;
+    nf.FirstBlock = b0;
+    nf.NValues = m.Vals.Len() as u32 - v0;
+    m.Funcs.Set(fi as usize, nf);
+}
+
+// Is block b (outside the loop) entered from the loop?
+bool PfIsExit(in Module m, in EFunc f, u32 b, in List<bool> inLoop) {
+    for (u32 p = 0; p < f.NBlocks; p++) {
+        if (!inLoop.Get(p as usize)) continue;
+        EBlock pb = m.Block(f.FirstBlock + p);
+        EInst term = m.Inst(pb.FirstInst + pb.NInsts - 1);
+        for (u32 o = term.FirstOp; o < term.FirstOp + term.NOps; o++) {
+            EOp op = m.Op(o);
+            if (op.Kind == OK_TARGET && op.Ref - f.FirstBlock == b) return true;
+        }
+    }
+    return false;
+}
+
+// The local's value back into the field.
+void PfStoreBack(ref Module m, u32 blk, in PromoteSite site, u32 local, u32 addr) {
+    u32 x = PfNew(ref m, site.FieldTy, blk);
+    PfEmit(ref m, blk, PF_LOAD, site.FieldTy, x, local, NONE, 0);
+    PfEmit(ref m, blk, PF_STORE, site.FieldTy, 0, x, addr, 0);
+}
+
+u32 PfNew(ref Module m, u32 ty, u32 blk) {
+    u32 v = m.Vals.Len() as u32;
+    m.Vals.Push(new EVal { Type = ty, Block = blk, Inst = 0, Pos = 0 });
+    return v;
+}
+
+// Appends `op ty a, b` (result r, 0 for none; imm) to block blk; sets r's instruction.
+void PfEmit(ref Module m, u32 blk, u16 op, u32 ty, u32 r, u32 a, u32 b, u64 imm) {
+    u32 firstOp = m.Ops.Len() as u32;
+    u32 n = 0;
+    if (a != NONE) {
+        m.Ops.Push(new EOp { Kind = OK_VALUE, Ref = a, Int = 0, Str = TextOf(""), Args = 0, NArgs = 0, Pos = 0 });
+        n++;
+    }
+    if (b != NONE) {
+        m.Ops.Push(new EOp { Kind = OK_VALUE, Ref = b, Int = 0, Str = TextOf(""), Args = 0, NArgs = 0, Pos = 0 });
+        n++;
+    }
+    m.Insts.Push(new EInst { Op = op, Ty = ty, Ty2 = 0, Result = r, FirstOp = firstOp, NOps = n, Block = blk, Imm = imm, Str = TextOf(""), Pos = 0, Src = 0 });
+    if (r != 0) {
+        EVal val = m.Val(r);
+        val.Block = blk;
+        val.Inst = m.Insts.Len() as u32 - 1;
+        m.Vals.Set(r as usize, val);
+    }
+}
